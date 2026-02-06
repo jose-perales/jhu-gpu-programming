@@ -1,0 +1,11 @@
+[project]
+name = "assignment"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.10.8",
+    "pandas>=3.0.0",
+    "pillow>=12.1.0",
+    "scikit-image>=0.26.0",
+]
