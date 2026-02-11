@@ -5,7 +5,7 @@ Modify the blocks.cu and grids.cu CUDA code to execute at least 5 different numb
 ## Blocks.cu Configurations (1D)
 
 | Config | Threads | Block Size | Blocks | Command |
-|--------|---------|------------|--------|---------|
+| -------- | --------- | ------------ | -------- | --------- |
 | blocks-run1 | 64 | 16 | 4 | `make blocks-run1` |
 | blocks-run2 | 128 | 32 | 4 | `make blocks-run2` |
 | blocks-run3 | 256 | 64 | 4 | `make blocks-run3` |
@@ -17,7 +17,7 @@ Run with `make blocks-run1`, etc., or `make blocks-run-all` for all configuratio
 ## Grids.cu Configurations (2D)
 
 | Config | Grid Dims | Block Dims | Total Threads | Command |
-|--------|-----------|------------|---------------|---------|
+| -------- | ----------- | ------------ | --------------- | --------- |
 | grids-run1 | 1×4 | 32×4 | 512 | `make grids-run1` |
 | grids-run2 | 2×2 | 16×8 | 512 | `make grids-run2` |
 | grids-run3 | 4×2 | 8×8 | 512 | `make grids-run3` |
@@ -55,19 +55,22 @@ CUDA organizes parallel threads into a hierarchy:
 - **Thread**: Individual unit of execution
 
 ### 1D Organization (blocks.cu)
+
 - `threadIdx.x` - Thread's index within its block
 - `blockIdx.x` - Which block the thread belongs to
 - `blockDim.x` - Number of threads per block
 - Global thread index: `globalIdx = blockIdx.x * blockDim.x + threadIdx.x`
 
 ### 2D Organization (grids.cu)
+
 - `threadIdx.x/y` - Thread's 2D index within its block
 - `blockIdx.x/y` - 2D block position in the grid
 - `blockDim.x/y` - Block dimensions
 - `gridDim.x/y` - Grid dimensions
 
 Thread indexing in 2D:
-```
+
+```cpp
 idx = blockIdx.x * blockDim.x + threadIdx.x
 idy = blockIdx.y * blockDim.y + threadIdx.y
 global_idx = (gridDim.x * blockDim.x) * idy + idx
