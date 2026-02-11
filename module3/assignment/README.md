@@ -9,6 +9,7 @@ make
 ```
 
 Or step by step:
+
 ```bash
 make preprocess
 make build
@@ -26,12 +27,12 @@ make postprocess
 
 ### Interpretation
 
-Branching had a large negative effect on the CPU contrast processing, but almost no effect on the GPU. I'm not sure why the GPU branching didn't perform worse, it might be due to the dataset (distribution of greyscale pixel) or how the branching and non-branching was implemented.
+Branching had a large negative effect on the CPU contrast processing, but almost no effect on the GPU. I'm not sure why the GPU branching didn't perform worse, it might be due to the dataset (distribution of grey scale pixel) or how the branching and non-branching was implemented.
 
 ### Before and After
 
 | Original | Contrast Adjusted |
-|----------|-------------------|
+| ---------- | ------------------- |
 | ![astronaut](images/astronaut.png) | ![astronaut contrast](images/astronaut_contrast.png) |
 | ![camera](images/camera.png) | ![camera contrast](images/camera_contrast.png) |
 | ![cat](images/cat.png) | ![cat contrast](images/cat_contrast.png) |
@@ -48,6 +49,7 @@ Branching had a large negative effect on the CPU contrast processing, but almost
 - `block_size`: threads per block (default 256)
 
 Examples with different block sizes:
+
 ```bash
 ./assignment.exe 0 64
 ./assignment.exe 0 128
@@ -65,12 +67,12 @@ Code Issues include:
 
 1. Syntax error on line:
 
-```cpp
-std::cout <endl<< " Time elapsed GPU = " << std::chrono::duration_castchrono::nanoseconds>(stop - start).count() << "ns\n";
-```
+    ```cpp
+    std::cout <endl<< " Time elapsed GPU = " << std::chrono::duration_castchrono::nanoseconds>(stop - start).count() << "ns\n";
+    ```
 
-- `std::cout <endl<<` should be `std::cout << ... << std::endl;`
-- `duration_castchrono::nanoseconds>` should be `duration_cast<std::chrono::nanoseconds>`
+    - `std::cout <endl<<` should be `std::cout << ... << std::endl;`
+    - `duration_castchrono::nanoseconds>` should be `duration_cast<std::chrono::nanoseconds>`
 
 2. `N` is not defined in the main function, but `int a[N], b[N], c[N]` are stack-allocated. If `N` is very large, this could overflow the stack.
 

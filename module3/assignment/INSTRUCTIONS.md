@@ -59,10 +59,10 @@ return 0;
 }
 ```
 
-# Assignment Rubric
+## Assignment Rubric
 
 | Criteria | Proficient | Competent | Novice | Pts |
-|----------|------------|-----------|--------|-----|
+| ---------- | ------------ | ----------- | -------- | ----- |
 | Create a program that demonstrates a large number of threads, at a minimum 64 threads with one block size, performing a simple operation in a GPU kernel. | 12.5 pts - at least 64 threads in one block at a minimum | 6.25 pts - The operation runs without a variable number of threads | 0 pts | 12.5 pts |
 | In the same or separate program from above execute the same algorithm as the GPU kernel but with CPU function. Make sure that it is using the same amount of data as the GPU kernel as the basis for its work. | 12.5 pts | 6.25 pts | 0 pts | 12.5 pts |
 | Update the same program or create a new one to execute the GPU kernel but with at least 1 conditional branching statement. | 12.5 pts | 6.25 pts | 0 pts | 12.5 pts |
@@ -73,4 +73,4 @@ return 0;
 | Stretch Problem | 5 pts - Identify both issues and good qualities of the code in the assignment text | 2.5 pts - Identify issues or good qualities of the code in the assignment text | 0 pts | 5 pts |
 | Quality of your code, measured by use of constants, well-named variables and functions, and useful comments in code | 10 pts - exceptional code quality | 5 pts - fairly high quality code | 0 pts - decent to good code quality | 10 pts |
 
-**Total Points: 100**
+Total Points: 100

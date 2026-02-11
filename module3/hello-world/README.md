@@ -4,11 +4,11 @@ Modify the hello-world.cu CUDA code to execute 5 different numbers of threads, w
 
 ## Configurations
 
-| Config | Threads | Block Size | Blocks | Output |
-|--------|---------|------------|--------|--------|
-| run1   | 16      | 16         | 1      | Thread IDs 0-15 |
-| run2   | 32      | 16         | 2      | IDs 0-15 × 2 blocks |
-| run3   | 256     | 64         | 4      | IDs 0-63 × 4 blocks |
+| Config | Threads | Block Size | Blocks | Output               |
+|--------|---------|------------|--------|----------------------|
+| run1   | 16      | 16         | 1      | Thread IDs 0-15      |
+| run2   | 32      | 16         | 2      | IDs 0-15 × 2 blocks  |
+| run3   | 256     | 64         | 4      | IDs 0-63 × 4 blocks  |
 | run4   | 1024    | 128        | 8      | IDs 0-127 × 8 blocks |
 | run5   | 512     | 256        | 2      | IDs 0-255 × 2 blocks |
 
@@ -23,6 +23,7 @@ CUDA organizes parallel threads into a hierarchy:
 - **Thread**: Individual unit of execution
 
 Each thread knows its position:
+
 - `threadIdx.x` - Thread's index within its block (resets to 0 in each block)
 - `blockIdx.x` - Which block the thread belongs to
 - `blockDim.x` - Number of threads per block
