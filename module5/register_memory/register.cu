@@ -1,8 +1,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#ifndef KERNEL_LOOP
 #define KERNEL_LOOP 2048
+#endif
+
+#ifndef KERNEL_SIZE
 #define KERNEL_SIZE 128
+#endif
 
 __host__ void wait_exit(void)
 {
