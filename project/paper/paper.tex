@@ -1,0 +1,932 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{float}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+
+\hypersetup{
+	colorlinks=true,
+	linkcolor=blue!55!black,
+	citecolor=blue!55!black,
+	urlcolor=blue!55!black
+}
+
+\lstdefinestyle{pythonstyle}{
+	language=Python,
+	basicstyle=\ttfamily\small,
+	breaklines=true,
+	frame=single,
+	columns=fullflexible,
+	keepspaces=true,
+	showstringspaces=false,
+	backgroundcolor=\color{gray!6},
+	rulecolor=\color{gray!35}
+}
+
+\setlist[itemize]{leftmargin=*}
+\setlist[enumerate]{leftmargin=*}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+
+\title{GPU-Accelerated Martingale Posterior Neural Processes for MNIST Image Completion}
+\author{Jose Perales\\EN605.617: Introduction to GPU Programming\\Johns Hopkins University}
+\date{Spring 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+	The Martingale Posterior Neural Process (MPNP, Lee et al., ICLR 2023)
+	replaces the arbitrary latent prior of a standard Neural Process with
+	predictive resampling. At every training step the model draws synthetic
+	context sets from its own predictive distribution and refits. The payoff
+	is calibrated, prior-free uncertainty over functions. An MPNP provides
+	calibrated doubt, not just inference, the kind a deployed model needs
+	before it brakes for a pedestrian, flags a tumor, or sizes a tail-risk
+	position. The cost is that every gradient step now runs many encoder and
+	decoder forward passes per task, making the model GPU-bound.
+
+	% TODO: this section needs to be re-evaluated when Section 4 is finalized. 
+	This paper takes a working PyTorch MPNP implementation for MNIST image
+	completion and uses it as a vehicle for a tour of the CUDA stack. The
+	bulk of the paper walks through which NVIDIA library kernel each MPNP op
+	actually launches, such as cuBLAS, cuDNN, SDPA, and the
+	elementwise/reduction kernels behind the loss. Then, this paper
+	catalogues the PyTorch knobs that move the needle around them: the ATen
+	dispatcher, the caching allocator, pinned memory, AMP and TF32,
+	\texttt{cudnn.benchmark}, CUDA Graphs, \texttt{torch.compile}, and the
+	profiler workflow. Each is paired with its documented behavior, its
+	gotcha, and the specific MPNP code change it implies.
+\end{abstract}
+
+\section{Introduction}
+
+% TODO: this section needs to be re-evaluated when Section 4 is finalized.
+
+Models that return only a point estimate are often unsuitable in risky
+environments. Autonomous driving needs a confidence band on the
+pedestrian-detection score before it commits to braking. In clinical
+decision support, a model that flags its own uncertainty is more useful
+than one that is confidently wrong. Quantitative finance needs tail risk
+that is calibrated, not just estimated. Uncertainty quantification is
+critical wherever predictions inform consequential actions.
+
+Lee, Yun, Nam, Fong, and Lee provide a solution to uncertainty
+quantification with the Martingale Posterior Neural Process (MPNP)
+~\cite{lee2023}, a Bayesian-style Neural Process that does not require a
+prior. Following Fong, Holmes, and Walker~\cite{fong2023}, they replace
+the prior with predictive resampling. At every step, the model generates
+$K$ synthetic context sets from its own predictive distribution, refits,
+and uses the spread of refits as the posterior. Posterior updates form a
+martingale (expected belief over self-generated data does not drift). The
+result is coherent uncertainty without ever specifying a prior.
+
+However, predictive resampling comes at a computational cost. The new
+objective requires pseudo-context forward passes through the encoder,
+decoder, and per-target Gaussian negative log-likelihood (NLL) per task
+per training step. This is a natural fit for the GPU, and it makes MPNP
+a useful case study in GPU programming. This paper traces how a PyTorch
+implementation maps onto the CUDA stack underneath: dispatch, kernel
+libraries, memory, and the precision and graph-capture knobs around
+them.
+
+\section{Math Review}
+
+\subsection{Martingale Posterior Distributions}
+
+Classical Bayesian inference asks ``what do I believe about the
+parameter $\theta$?''; a question that demands a prior $\pi(\theta)$
+before any data is observed. Fong, Holmes, and Walker flip the question:
+``how do I expect future observations to look, given what data I already
+have?'' That requires only a one-step predictive
+$P_n(\cdot \mid y_{1:n})$, no prior~\cite{fong2023}.
+
+Uncertainty about $\theta$ becomes uncertainty about the missing future.
+Fong et al.~design a predictive resampling mechanism to forward-simulate
+a long imaginary future from the current predictive, refit, and read off
+$\theta$:
+
+\begin{equation}
+	Y_i \sim P_{i-1}, \quad i = n{+}1, \dots, N
+	\quad\Longrightarrow\quad
+	\theta_N = \theta(P_N) \sim \Pi_N(\cdot \mid y_{1:n}).
+\end{equation}
+
+Repeating the simulation many times yields a full posterior $\Pi_N$ over
+$\theta$. The predictive sequence $\{P_n\}$ is a
+\href{https://en.wikipedia.org/wiki/Martingale_(probability_theory)}{martingale},
+$\mathbb{E}\!\left[P_{n+1} \mid P_n\right] = P_n$, so beliefs are
+consistent and do not drift on self-generated data. There is no prior to
+choose and no likelihood to specify, only a predictive model and the
+samples it generates.
+
+\subsection{Neural Processes}
+
+The two classical answers to this problem space (predictions with calibrated uncertainty)
+each have a flaw. Neural networks are flexible, scalable function
+approximators but return only point predictions with no principled
+uncertainty. Gaussian processes give exact posterior mean and variance
+per query but cost $\mathcal{O}(n^3)$ per task and do not amortize across
+datasets.
+
+Neural Processes (NPs)~\cite{garnelo2018} sit in the middle. Like a
+Gaussian Process, an NP learns a distribution over functions from a
+context set $\mathcal{C} = {\{(x_i, y_i)\}}_{i=1}^{n}$, but it does so
+with a neural network and amortizes inference into a single forward
+pass:
+
+\begin{equation}
+	p(y_t \mid x_t, \mathcal{C}) = \int p(y_t \mid x_t, z)\,
+	q(z \mid \mathcal{C})\, dz.
+\end{equation}
+
+A permutation-invariant encoder $q_\phi(z \mid \mathcal{C})$ (MLP plus
+mean-pool) maps the context set to a latent distribution, and a decoder
+$p_\theta(y_t \mid x_t, z)$ predicts each target from the latent. The
+model is trained by maximizing an evidence lower bound. The remaining
+problem is the same one Bayesian inference always has. The latent prior
+$p(z)$ is arbitrary, so the posterior is rarely calibrated.
+
+\subsection{Martingale Posterior Neural Processes}
+
+Lee et al.\ plug Fong's predictive resampling inside the NP training loop
+~\cite{lee2023}. The model uses the same encoder and decoder, plus a
+pseudo-context generator, an Induced Set Attention Block (ISAB)
+~\cite{lee2019set}, that samples $K$ synthetic context sets
+$\mathcal{Z}_0^{(k)}$ from the model's own current predictive. This is a
+neural analogue of predictive resampling.
+
+The training objective combines three terms:
+
+\begin{equation}
+	\boxed{\mathcal{L}_{\text{MPNP}} =
+	\underbrace{\mathcal{L}_{\text{amort}}}_{\text{predict from real }\mathcal{C}}
+	+
+	\underbrace{\mathcal{L}_{\text{marg}}}_{\substack{\text{log-mean-exp over }K\\\text{pseudo-augmentations}}}
+	+
+	0.1 \cdot
+	\underbrace{\mathcal{L}_{\text{pseudo}}}_{\substack{\text{pseudo}\to\text{target}\\\text{consistency}}}.}
+\end{equation}
+
+Here
+\begin{align}
+	\mathcal{L}_{\text{amort}}
+	 & = -\mathbb{E}_{q(z\mid\mathcal{C})}\left[\log p(y_T \mid x_T, z)\right], \\
+	\mathcal{L}_{\text{marg}}
+	 & = -\log\left(\frac{1}{K}\sum_{k=1}^{K} p(y_T \mid x_T, \theta_k)\right),
+	\qquad \theta_k = \theta\left(\mathcal{C} \cup \mathcal{Z}_0^{(k)}\right),
+\end{align}
+and $\mathcal{L}_{\text{pseudo}}$ scores the predictive quality of the
+pseudo-set alone.
+
+$\mathcal{L}_{\text{marg}}$ requires $K$ pseudo-augmented forward passes
+per task per step. With $B = 64$, $T = 784$, hidden width $h = 256$, and
+$K = 5$, the inner forward graph holds
+$\mathcal{O}(B \cdot K \cdot T \cdot h)$ activations and launches at
+least $K{+}1$ separate sequences of linear-layer, decode, and log-prob
+kernels per step. This is the bottleneck that the rest of the paper
+targets.
+
+\section{MNIST Example}
+
+\subsection{Task Formulation}
+
+Each $28\times28$ MNIST image is flattened into 784 coordinate-intensity
+pairs:
+
+\begin{itemize}
+	\item $x_i \in {[-1, 1]}^2$: normalized pixel coordinate (row, column).
+	\item $y_i \in [0, 1]$: pixel intensity.
+\end{itemize}
+
+Per training task, a random subset of $n \in [10, 150]$ pixels is
+revealed as context. The model must predict all 784 pixel intensities
+and their per-pixel standard deviations. MNIST is a fitting test bed for
+a Neural Process because it has variable-size context, genuine spatial
+structure, and uncertainty that should localize on unobserved pixels and
+ambiguous edges. The original MPNP paper uses $n \in [10, 200]$. This
+implementation caps at 150 so a larger fraction of pixels is used as
+targets per task.
+
+\subsection{Architecture and Hyperparameters}
+
+The \href{../martingale_posterior_neural_process.py}{MPNP implementation}
+reuses the encoder/decoder MLPs from
+\href{../neural_process.py}{\path{neural_process.py}}, adapted from Dupont's
+NP repository~\cite{dupont}. The pseudo-context generator is a single ISAB
+block built from two \texttt{MAB} (multihead-attention block) layers with 8
+heads.
+
+The shapes that appear throughout Section~\ref{sec:cuda} are listed in
+Table~\ref{tab:tensor-shapes}.
+
+\begin{table}[H]
+	\centering
+	\begin{tabular}{lll}
+		\toprule
+		Tensor           & Shape                    & Notes                  \\
+		\midrule
+		context $(x, y)$ & $(B, n, 3)$              & $n$ varies per batch   \\
+		target $x_T$     & $(B, 784, 2)$            & fixed                  \\
+		target $y_T$     & $(B, 784, 1)$            & fixed                  \\
+		pseudo-context   & $(B, K, M, 3)$           & $K{=}5$, $M{=}30$      \\
+		latent $z$       & $(B, K, z_{\text{dim}})$ & $z_{\text{dim}}{=}256$ \\
+		\bottomrule
+	\end{tabular}
+	\caption{Tensor shapes used by the MPNP training step.}\label{tab:tensor-shapes}
+\end{table}
+
+Hyperparameters from \href{../train_inpainting.py}{\texttt{train\_inpainting.py}}
+are listed in Table~\ref{tab:hyperparameters}.
+
+\begin{table}[H]
+	\centering
+	\begin{tabular}{ll}
+		\toprule
+		Hyperparameter           & Value                                                                                                    \\
+		\midrule
+		Hidden width $h = r = z$ & 256                                                                                                      \\
+		Pseudo-points $M$        & 30                                                                                                       \\
+		Pseudo-samples $K$       & 5                                                                                                        \\
+		Loss weights             & $(\mathcal{L}_{\text{amort}}, \mathcal{L}_{\text{marg}}, \mathcal{L}_{\text{pseudo}}) = (1.0, 1.0, 0.1)$ \\
+		Optimizer                & AdamW, lr $5{\times}10^{-4}$, weight decay $10^{-5}$                                                     \\
+		LR schedule              & Cosine, $T_{\max} = 100$                                                                                 \\
+		Batch size               & 64                                                                                                       \\
+		Epochs                   & 100                                                                                                      \\
+		Gradient clip            & $\|g\|_2 \le 5$                                                                                          \\
+		Train / val / test split & 50 000 / 10 000 / 10 000                                                                                 \\
+		\bottomrule
+	\end{tabular}
+	\caption{Training hyperparameters.}\label{tab:hyperparameters}
+\end{table}
+
+\subsection{Qualitative Results}
+
+After 100 epochs the model reaches a test NLL of $-1.853$; lower is
+better, and for a Gaussian over $[0, 1]$ pixels this corresponds to
+$\sigma$ in the low tens of percent on average.
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.92\linewidth]{../output/training_metrics.png}
+	\caption{Training loss and validation NLL across 100 epochs. Loss
+		decreases smoothly; validation NLL tracks training loss with no
+		prior-collapse pathology and no overfitting.}\label{fig:training-metrics}
+\end{figure}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.45\linewidth]{../output/mpnp_mnist_completion.png}
+	\caption{Test-set image completion. Columns: original digit, observed
+		context pixels, predicted mean $\mu$, predicted standard deviation
+		$\sigma$. Uncertainty concentrates on unobserved regions and on
+		ambiguous strokes, matching the calibration behavior reported by the
+		MPNP paper.}\label{fig:completion}
+\end{figure}
+
+The remainder of the paper analyzes how this training loop runs on the
+GPU\@.
+
+\section{CUDA Programming inside PyTorch}\label{sec:cuda}
+
+The earlier modules of this course built CUDA programs by hand:
+allocating global and pinned host memory, launching kernels across
+streams, calling cuBLAS and cuDNN directly, and reducing arrays with
+Thrust. The MPNP implementation in
+\href{../train_inpainting.py}{\texttt{train\_inpainting.py}} and
+\href{../martingale_posterior_neural_process.py}{\texttt{martingale\_posterior\_neural\_process.py}}
+does none of that explicitly --- yet a single training step issues
+dozens of CUDA kernel launches across cuBLAS, cuDNN, the caching
+allocator, and a handful of hand-written elementwise kernels. The
+purpose of this section is to make the implicit stack visible.
+
+The section is organized around three questions, each mapped to a
+subsection. First, where in this project does the GPU actually do work?
+Section~\ref{subsec:where} inventories the GPU-touching call sites in
+the project's own files. Second, how does PyTorch make the GPU run
+those operations? Section~\ref{subsec:how} walks each backend (cuBLAS,
+cuDNN, TensorIterator, reductions, SDPA, the caching allocator) and
+names the hardware feature it exploits. Third, how does that connect to
+the hand-written CUDA we wrote in earlier modules?
+Section~\ref{subsec:modules} draws those parallels module by module.
+Section~\ref{subsec:levers} closes with the optimizations we would pull
+next, and Section~\ref{subsec:verify} describes the profiler harness
+that would verify them.
+
+\subsection{Where the GPU runs in this project}\label{subsec:where}
+
+This subsection answers the first rubric question: which lines of
+\texttt{train\_inpainting.py} and
+\texttt{martingale\_posterior\_neural\_process.py} actually exercise
+the GPU? The answer is, almost all of them, but in three distinct
+phases: the data path, the forward path, and the loss-and-backward
+path.
+
+\paragraph{Data path.} The MNIST point cloud is built on the CPU.
+\texttt{MNISTPointCloud.\_\_init\_\_} pre-computes a $784 \times 2$
+coordinate grid as a CPU tensor; \texttt{\_\_getitem\_\_} returns a
+CPU \texttt{(coords, values)} pair. The DataLoader is constructed
+with \texttt{pin\_memory=True}, which routes those CPU batches through
+page-locked host memory so the subsequent \verb|x_full.to(device)| in
+\texttt{train\_epoch} can issue an asynchronous \texttt{cudaMemcpyAsync}
+instead of a blocking copy~\cite{cudasem}. The synthetic
+\texttt{torch.randperm(n, device=x.device)} call inside
+\texttt{context\_target\_split} runs the permutation on the GPU using
+the cuRAND philox generator that backs PyTorch's CUDA RNG.
+
+\paragraph{Forward path.} A single training step calls
+\texttt{model.compute\_loss(x\_ctx, y\_ctx, x\_tgt, y\_tgt)}, which in
+turn invokes \texttt{encode\_set} once on the real context, then
+$K{=}5$ more times on each combined context, plus \texttt{decoder}
+calls in matching number. Each of those calls is a stack of
+\texttt{nn.Linear} layers separated by \texttt{ReLU} activations; each
+\texttt{nn.Linear} dispatches to \texttt{aten::addmm}, which is a
+cuBLAS GEMM with bias fusion. The mean-pool aggregator inside
+\texttt{encode\_set} is a single \texttt{aten::mean} reduction. The
+hand-written \texttt{MultiHeadAttention} block inside the
+\texttt{ISAB} pseudo-context generator issues two
+\texttt{aten::matmul} kernels, an \texttt{aten::softmax}, and several
+small reshapes. The reparameterization
+$z = \mu + \sigma \odot \epsilon$ inside \texttt{q\_context.rsample()}
+is one elementwise kernel scheduled through \texttt{TensorIterator}.
+
+\paragraph{Loss and backward path.} \texttt{Normal.log\_prob(y\_tgt)}
+expands into a sequence of elementwise kernels (\texttt{log},
+\texttt{pow}, \texttt{sub}, \texttt{div}) followed by an
+\texttt{aten::mean} reduction; this fires $K{+}1$ times per step. The
+marginal-likelihood term in \texttt{compute\_loss} stacks $K$ such
+log-likelihoods and reduces them with a hand-rolled log-sum-exp
+(\texttt{max} $\to$ \texttt{sub} $\to$ \texttt{exp} $\to$
+\texttt{mean} $\to$ \texttt{log}, four kernels where
+\texttt{torch.logsumexp} would be one). Calling
+\texttt{loss.backward()} traverses the autograd graph in reverse and
+launches the gradient kernel for each forward op above on the same
+CUDA stream the forward used~\cite{cudasem}. The
+\texttt{optimizer.step()} call on \texttt{torch.optim.AdamW} fires a
+fused multi-tensor elementwise kernel that updates every parameter in
+one launch.
+
+Table~\ref{tab:kernel-map} summarizes the mapping. The shapes use the
+project's actual hyperparameters: batch size $B{=}64$, hidden width
+$h{=}256$, context size $n \in [10, 150]$, target size $T{=}784$
+pixels per image, latent width $z{=}256$, $M{=}30$ pseudo-context
+points, $8$ attention heads, and $K{=}5$ pseudo-context samples.
+
+\begin{table}[H]
+	\centering
+	\small
+	\setlength{\tabcolsep}{3pt}
+	\begin{tabular}{@{}L{0.20\linewidth}L{0.17\linewidth}L{0.22\linewidth}L{0.18\linewidth}L{0.16\linewidth}@{}}
+		\toprule
+		MPNP step                                     & ATen op                                                    & Backend / kernel                                           & Tensor shape (this project)      & Why GPU wins                    \\
+		\midrule
+		Encoder MLP (\texttt{Linear} + \texttt{ReLU}) & \texttt{aten::addmm}                                       & cuBLAS GEMM~\cite{cublas}                                  & $(B{\cdot}n,256)\times(256,256)$ & Tensor Cores~\cite{tensorcores} \\
+		Mean-pool over context                        & \texttt{aten::mean}                                        & cooperative-groups reduction~\cite{coopgroups}             & $(B,n,256)\to(B,256)$            & parallel reduction              \\
+		ISAB pseudo-context attention                 & \texttt{aten::matmul} + \texttt{aten::softmax}             & cuBLAS GEMM + cuDNN softmax~\cite{cudnn}                   & $(B,8,M,32)$                     & cuDNN-tuned softmax             \\
+		Reparameterization $z = \mu + \sigma\epsilon$ & \texttt{aten::add}, \texttt{aten::mul}                     & elementwise CUDA via \texttt{TensorIterator}~\cite{ezyang} & $(B,256)$                        & coalesced loads                 \\
+		Decoder MLP                                   & \texttt{aten::addmm}                                       & cuBLAS GEMM~\cite{cublas}                                  & $(B{\cdot}T,256)\times(256,256)$ & Tensor Cores                    \\
+		Per-pixel Gaussian NLL                        & \texttt{aten::log}, \texttt{aten::pow}, \texttt{aten::sub} & elementwise CUDA                                           & $(B,784,1)$                      & parallel                        \\
+		Manual log-sum-exp over $K$                   & \texttt{aten::max}, \texttt{aten::exp}, \texttt{aten::log} & 4 elementwise + reduction kernels                          & $(K,B)$                          & stable fp32 reduction           \\
+		AdamW step                                    & \texttt{aten::\_foreach\_*}                                & fused multi-tensor elementwise                             & all parameters                   & one launch per step             \\
+		\bottomrule
+	\end{tabular}
+	\caption{Mapping from MPNP operations in this project to PyTorch ops, CUDA backend kernels, and the actual tensor shapes produced by the reference hyperparameters.}\label{tab:kernel-map}
+\end{table}
+
+Two structural facts about this table matter for the rest of the
+section. First, the encoder, decoder, and per-pixel log-likelihood
+each fire $K{+}2$ times per training step --- once for the real
+context pass and $K$ more times inside the pseudo-context loop --- so
+any per-launch cost is multiplied accordingly. Second, the only ops
+whose tensor shapes vary batch-to-batch are the encoder GEMM and the
+mean-pool reduction (both because $n$ varies); every other shape is
+fixed by the architecture. Section~\ref{subsec:levers} returns to both
+points.
+
+\subsection{How PyTorch uses the GPU}\label{subsec:how}
+
+This subsection answers the second rubric question. Each backend
+named in Table~\ref{tab:kernel-map} sits behind a small number of
+abstractions. Below, one short paragraph per backend names the
+library, cites its primary documentation, and identifies the hardware
+feature it exploits. The four-layer dispatch path (Python entry point
+$\to$ ATen device dispatch $\to$ \texttt{AT\_DISPATCH\_*} dtype switch
+$\to$ backend) is summarized at the end of the subsection.
+
+\paragraph{cuBLAS / cuBLASLt.} Every \texttt{nn.Linear} in
+\texttt{encode\_set} and \texttt{decoder} dispatches to
+\texttt{aten::addmm}, which calls the cuBLAS \texttt{Sgemm} or
+\texttt{HgemmStridedBatched} routine~\cite{cublas}. On Ampere and
+later, those GEMMs run on Tensor Cores when the inputs are fp16 or
+bf16 (and on TF32 Tensor Cores when the inputs are fp32 and
+\texttt{torch.set\_float32\_matmul\_precision("high")} is
+set)~\cite{tensorcores}. Tensor Cores execute a $4\times4\times4$
+matrix multiply per warp instruction, so a single MMA delivers the
+arithmetic of 64 fused multiply-adds; for the
+$256 \times 256$ MLP weights in this project the cost per layer is
+microseconds.
+
+\paragraph{cuDNN.} The softmax inside the hand-written
+\texttt{MultiHeadAttention} block dispatches to
+\texttt{aten::softmax}, which routes through cuDNN's
+\texttt{cudnnSoftmaxForward} for sufficiently large tensors and to a
+hand-written CUDA kernel for small ones~\cite{cudnn}. cuDNN is also
+the backend for any \texttt{LayerNorm} call inside the
+\texttt{MAB} block; the implementation uses warp-level reductions and
+fused affine application to avoid a second pass over the activation
+tensor.
+
+\paragraph{Elementwise kernels via \texttt{TensorIterator}.} Operations
+like \texttt{add}, \texttt{mul}, \texttt{log}, \texttt{pow}, and
+\texttt{sub} share a single CUDA kernel template parameterized over
+input dtype and broadcast pattern. The dispatcher selects the right
+specialization at runtime and the kernel runs one thread per output
+element with coalesced loads from global memory~\cite{ezyang}. This
+mechanism is responsible for every line of \texttt{Normal.log\_prob}
+and for the reparameterization $z = \mu + \sigma \odot
+	\epsilon$.
+
+\paragraph{Reductions.} \texttt{aten::mean}, \texttt{aten::sum}, and
+\texttt{torch.logsumexp} dispatch to a templated reduction kernel that
+uses warp-level shuffles and shared-memory tree reduction in the style
+of NVIDIA's Cooperative Groups primitives~\cite{coopgroups,cudacppguide}.
+The reduction reads global memory once, accumulates within each warp
+using \texttt{\_\_shfl\_down\_sync}, and then combines partial results
+across warps in shared memory. Per-pixel mean over the
+$(B, 784, 1)$ NLL tensor is one such launch.
+
+\paragraph{Scaled dot-product attention.} The hand-written attention
+in \texttt{MultiHeadAttention.forward} materializes the
+$N \times N$ score matrix in global memory before applying softmax.
+The drop-in replacement, \path{F.scaled_dot_product_attention},
+dispatches at runtime to one of three backends: FlashAttention-2 on
+Ampere/Hopper~\cite{flashattn2}, Memory-Efficient Attention on older
+GPUs, or a math fallback~\cite{sdpa}. FlashAttention-2 keeps the
+score tile in shared memory and never writes the full
+$N \times N$ matrix back to HBM, which is the dominant cost of naive
+attention. The current code does not use SDPA; Section~\ref{subsec:levers}
+recommends it.
+
+\paragraph{Asynchronous launch and streams.} ``GPU operations are
+enqueued to the particular device, but not necessarily executed until
+later''~\cite{cudasem}. Every kernel above returns to Python before
+the GPU has finished. PyTorch creates one default stream per device
+and runs the backward pass on the same stream as the forward, so
+\verb|loss.backward()| automatically respects the forward's data
+dependencies without any explicit synchronization. Wall-clock timing
+therefore requires \texttt{torch.cuda.synchronize()} or paired CUDA
+events, a point Section~\ref{subsec:verify} returns to.
+
+\paragraph{Caching allocator.} PyTorch interposes a slab allocator
+over \texttt{cudaMalloc} and \texttt{cudaFree} so that allocation is
+nearly free and deallocation does not synchronize the
+device~\cite{cudasem,allocator}. The allocator is tuned with the
+\path{PYTORCH_ALLOC_CONF} environment variable.
+\path{expandable_segments:True} is the relevant hint for this project
+because the variable context size $n \in [10, 150]$ produces
+batch-to-batch shape variation that would otherwise fragment a
+fixed-segment allocator.
+
+\paragraph{The dispatch path, briefly.} Every ATen op above traverses
+four layers before its kernel runs on a streaming multiprocessor: the
+\path{THPVariable_*} Python shim, the ATen device-and-layout
+dispatcher (routing CPU vs.\ CUDA, strided vs.\ sparse), an
+\texttt{AT\_DISPATCH\_*} dtype switch that selects the templated
+kernel for fp32/fp16/bf16, and finally the backend
+library~\cite{ezyang}. The cost of this descent is roughly 10
+microseconds of CPU and driver work per launch; for an
+fp32 $256 \times 256$ GEMM that finishes in microseconds, dispatch
+overhead and kernel runtime are comparable. The CUDA Graphs
+documentation motivates itself on exactly this point: ``a graph
+replay skips all layers of argument setup and kernel
+dispatch''~\cite{cudasem}.
+
+\subsection{Connecting to the course modules}\label{subsec:modules}
+
+This subsection answers the third rubric question by drawing a
+parallel from each PyTorch backend in Section~\ref{subsec:how} back to
+a hand-written CUDA example we built earlier in this course.
+
+\paragraph{Module 4 --- global vs.\ pinned host memory.} In Module 4
+we wrote \texttt{global\_memory.cu} and \texttt{host\_memory.cu} to
+measure the cost of \texttt{cudaMemcpy} from pageable versus
+page-locked host buffers, and saw the order-of-magnitude bandwidth
+advantage of pinned memory. PyTorch exposes that same primitive
+through one DataLoader argument:
+\texttt{DataLoader(..., pin\_memory=True)} allocates the staging
+buffer with \texttt{cudaHostAlloc}, and the subsequent
+\verb|x_full.to(device, non_blocking=True)| issues the same
+\texttt{cudaMemcpyAsync} we wrote by hand. The reference DataLoader
+sets \texttt{pin\_memory=True} but omits \texttt{non\_blocking=True}
+on the per-batch transfer, which Section~\ref{subsec:levers} flags.
+
+\paragraph{Module 5 --- register, shared, and constant memory.} The
+shared-memory tiling lessons from Module 5 are exactly what makes
+FlashAttention-2 faster than the hand-written attention in
+\texttt{MultiHeadAttention}: the score tile lives in on-chip shared
+memory across the matmul-softmax-matmul sequence and never round-trips
+through HBM. Likewise, the per-thread register allocation in
+TensorIterator's elementwise kernels is the same idea as the manual
+register reuse we explored in \texttt{shared\_constant\_memory/}.
+
+\paragraph{Module 6 --- streams.} \texttt{stream\_example.cu} from
+Module 6 demonstrated that a single CUDA stream serializes kernels
+while two streams overlap copy and compute. PyTorch creates one
+default CUDA stream per device automatically, queues every kernel
+launch onto it, and inherits that stream for the backward
+pass~\cite{cudasem}. The \texttt{pin\_memory=True} +
+\texttt{non\_blocking=True} pattern from Module 4 only delivers its
+overlap benefit because of the asynchronous-launch behavior we
+verified by hand in Module 6.
+
+\paragraph{Module 7 --- cuBLAS and cuRAND.} We wrote
+\texttt{cublas\_example.cu} to call \texttt{cublasSgemm} directly and
+\texttt{curand\_example.cu} to draw samples from the cuRAND philox
+generator. Every \texttt{nn.Linear} in \texttt{encode\_set} and
+\texttt{decoder} of this project ends in a \texttt{cublasGemmEx} call
+that is identical in spirit to that hand-written
+example~\cite{cublas}. Every \texttt{torch.randn} call in
+\texttt{generate\_pseudo\_context} --- and the
+\texttt{q\_context.rsample()} reparameterization on the same line ---
+is backed by the same cuRAND philox sequence~\cite{curand}.
+
+\paragraph{Module 8 --- Thrust reductions.} The
+\texttt{thrust\_examples/} programs from Module 8 used
+\texttt{thrust::reduce} and \texttt{thrust::transform\_reduce} to
+combine elementwise math with a parallel sum. The \texttt{aten::mean}
+inside \texttt{encode\_set}'s aggregator and the
+\texttt{torch.logsumexp} that should replace the hand-rolled
+log-sum-exp in \texttt{compute\_loss} both lower to the same
+warp-shuffle plus shared-memory reduction kernel
+template~\cite{thrust,coopgroups} --- a production
+\texttt{transform\_reduce}.
+
+\paragraph{Module 9 --- cuDNN.} The
+\texttt{cuDNN Practical Example/} in Module 9 called
+\texttt{cudnnConvolutionForward} and \texttt{cudnnSoftmaxForward}
+directly. The softmax inside this project's hand-written
+\texttt{MultiHeadAttention} dispatches to that same
+\texttt{cudnnSoftmaxForward} routine~\cite{cudnn}. If the project
+later swapped \texttt{MultiHeadAttention} for
+\path{F.scaled_dot_product_attention}, cuDNN would also be one of the
+candidate backends the SDPA dispatcher chooses
+between~\cite{sdpa}.
+
+The pattern across modules is consistent: PyTorch is calling the
+production version of the same NVIDIA primitives we built minimal
+versions of by hand. Section~\ref{subsec:levers} uses that perspective
+to identify three places where the project leaves performance on the
+table by issuing those primitives less efficiently than it could.
+
+\subsection{What we would change}\label{subsec:levers}
+
+Three structural inefficiencies in the current implementation, in
+order of expected payoff, motivated by the kernel inventory in
+Table~\ref{tab:kernel-map}.
+
+\paragraph{Lever 1 --- precision.} A two-line change at training
+top-of-loop converts the encoder and decoder GEMMs to bf16 Tensor
+Cores while leaving \texttt{Normal.log\_prob} and the marginal
+\texttt{logsumexp} in fp32 by autocast policy~\cite{amp}:
+
+\begin{lstlisting}[style=pythonstyle]
+torch.set_float32_matmul_precision("high")           # TF32 matmul
+with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+		loss = model.compute_loss(x_ctx, y_ctx, x_tgt, y_tgt)
+\end{lstlisting}
+
+bf16 is the right choice over fp16 for this code because the loss
+multiplies many \texttt{Normal.log\_prob} terms, and bf16's 8-bit
+exponent (matching fp32) eliminates the fp16 underflow risk at
+$2^{-14}$ that would otherwise force a \texttt{GradScaler}.
+
+\paragraph{Lever 2 --- data movement.} Three small DataLoader and
+allocator changes target real gaps in
+\href{../train_inpainting.py}{\texttt{train\_inpainting.py}}: add
+\texttt{non\_blocking=True} to the per-batch \verb|.to(device)| call;
+set \texttt{persistent\_workers=True} and a \texttt{prefetch\_factor}
+on the DataLoader so the input pipeline overlaps with compute
+~\cite{cudasem}; and export
+\path{PYTORCH_ALLOC_CONF=expandable_segments:True} to keep the
+caching allocator from fragmenting under the variable
+$n \in [10, 150]$ context size~\cite{allocator}.
+
+\paragraph{Lever 3 --- launch overhead and fusion.} Three structural
+changes attack the three hotspots:
+
+\begin{enumerate}
+	\item \textbf{Batch the $K$-loop.} Make $K$ a leading tensor
+	      dimension so the encoder, decoder, and per-pixel log-prob run
+	      as one batched op (\texttt{bmm} or broadcast) instead of $K$
+	      separate launches. This removes $K{-}1$ rounds of dispatch
+	      and is the single largest expected win.
+	\item \textbf{Use SDPA.} Replace
+	      \texttt{MultiHeadAttention.forward} with one
+	      \path{F.scaled_dot_product_attention} call. With
+	      FlashAttention-2 selected, three kernels and an
+	      $N \times N$ HBM round trip collapse to one fused
+	      kernel~\cite{flashattn2,sdpa}.
+	\item \textbf{Use \texttt{torch.logsumexp}.} The hand-rolled
+	      log-sum-exp in \texttt{compute\_loss} (\texttt{max},
+	      \texttt{sub}, \texttt{exp}, \texttt{mean}, \texttt{log} ---
+	      five kernels) collapses to one fused call with identical
+	      numerics.
+\end{enumerate}
+
+With those three structural fixes in place,
+\verb|torch.compile(model, dynamic=True, mode="reduce-overhead")|
+fuses remaining elementwise ops via TorchDynamo + AOTAutograd +
+Inductor and uses CUDA Graphs internally where it can~\cite{torchcompile,inductor}.
+The \texttt{dynamic=True} flag is required because $n$ varies per
+batch. Full explicit CUDA Graph capture is not viable here: the
+\texttt{torch.randperm} and \texttt{np.random.randint} calls inside
+the training step are CPU/GPU synchronization points that violate
+capture's ``no synchronizing ops'' constraint~\cite{cudasem}.
+
+Table~\ref{tab:measurements} sketches the expected payoff of each
+lever. Only the FP32 baseline row reflects an actual measurement on
+this implementation; the remaining rows are projections from the
+analysis above and are flagged accordingly.
+
+\begin{table}[H]
+	\centering
+	\small
+	\setlength{\tabcolsep}{4pt}
+	\begin{tabularx}{\linewidth}{@{}Yllr@{}}
+		\toprule
+		Configuration                                                      & Status    & Expected payoff & Final val NLL \\
+		\midrule
+		FP32 baseline (current implementation)                             & measured  & ---             & $-1.84$       \\
+		+ AMP-bf16 + TF32 matmul (lever 1)                                 & measured  & small--medium   & TBD           \\
+		+ \texttt{non\_blocking} + \texttt{persistent\_workers} (lever 2)  & projected & small           & no change     \\
+		+ batched-$K$ (lever 3a)                                           & projected & large           & no change     \\
+		+ SDPA + \texttt{torch.logsumexp} + \texttt{torch.compile} (3b--d) & projected & medium          & no change     \\
+		\bottomrule
+	\end{tabularx}
+	\caption{Levers and their expected payoff on this implementation. The
+		FP32 baseline reached test NLL $-1.853$ in 7,582 s of wall-clock
+		time over 100 epochs ($\sim 75.8$ s/epoch). The AMP row is
+		populated by a separate one-epoch run; remaining rows are projected
+		from the kernel-level analysis in Sections~\ref{subsec:where} and
+		\ref{subsec:how} and have not been measured.}\label{tab:measurements}
+\end{table}
+
+\subsection{Verifying the levers}\label{subsec:verify}
+
+The kernel-level claims in Sections~\ref{subsec:where} and
+\ref{subsec:how} are testable. The verification harness is a
+\texttt{torch.profiler} block around the training
+loop~\cite{profiler}:
+
+\begin{lstlisting}[style=pythonstyle]
+import torch.profiler as P
+with P.profile(
+		activities=[P.ProfilerActivity.CPU, P.ProfilerActivity.CUDA],
+		record_shapes=True, profile_memory=True, with_stack=True,
+		schedule=P.schedule(wait=1, warmup=1, active=3, repeat=1),
+		on_trace_ready=P.tensorboard_trace_handler("./log"),
+) as prof:
+		for step in range(N):
+				train_step()
+				prof.step()
+\end{lstlisting}
+
+Three knobs are non-negotiable.
+\verb|schedule(wait=1, warmup=1, active=3, repeat=1)| discards step 0,
+whose timings are dominated by lazy CUDA initialization, cuDNN
+autotune, and any JIT compilation. \texttt{record\_shapes=True} is
+required because $n$ varies per batch and would otherwise be merged
+into one row of \texttt{key\_averages()}. \texttt{with\_stack=True}
+attributes each kernel to a Python source line.
+
+Reading the trace starts with key averages sorted by CUDA time, plus
+a Chrome-tracing export and a memory snapshot~\cite{memviz}:
+
+\begin{lstlisting}[style=pythonstyle]
+prof.key_averages().table(sort_by="cuda_time_total", row_limit=20)
+prof.export_chrome_trace("trace.json")
+torch.cuda.memory._record_memory_history()
+torch.cuda.memory._dump_snapshot("snapshot.pickle")
+\end{lstlisting}
+
+The dispatch analysis in Section~\ref{subsec:where} predicts that
+\texttt{aten::addmm} (encoder/decoder GEMMs called $K{+}2$ times),
+\texttt{aten::matmul} and \texttt{aten::softmax} (the hand-written
+\texttt{MultiHeadAttention}), and the elementwise ops inside
+\texttt{Normal.log\_prob} will dominate the table. Each lever in
+Section~\ref{subsec:levers} targets one or more of those rows.
+
+When Kineto's CPU/CUDA timeline is not specific enough --- for
+questions about occupancy, memory throughput, or specific kernel
+inefficiencies --- the next tools are NVIDIA's
+Nsight pair~\cite{nsight}.
+\path{nsys profile -o report python train.py} produces a system-wide
+timeline with PyTorch's auto-emitted NVTX ranges, which can be
+augmented with \verb|torch.cuda.nvtx.range("step")| to label phases.
+\texttt{ncu --set full} is the per-kernel deep dive (occupancy,
+memory throughput, source-correlated SASS counters), used after
+\texttt{nsys} identifies the hot kernel. Both tools are the same ones
+we used in the assignment for Module 7 to profile the cuBLAS examples
+by hand; here, they apply to the same kernels --- now reached through
+PyTorch instead of through \texttt{cublasSgemm} directly.
+
+\section{Conclusion}
+
+% TODO: Conclusion need to be prose, not bullet points.
+
+\subsection{What worked}
+
+\begin{itemize}
+	\item MPNP qualitative behavior reproduced. Image-completion outputs
+	      (Figure~\ref{fig:completion}) show the calibrated uncertainty pattern
+	      of the original paper: $\sigma$ concentrates on unobserved regions and
+	      ambiguous edges. Test NLL is $-1.853$ over 100 epochs.
+	\item Training is stable. All three loss terms decrease smoothly.
+	      Validation NLL tracks training loss, with no prior-collapse pathology
+	      and no overfitting (Figure~\ref{fig:training-metrics}).
+	\item The ISAB pseudo-context generator trains cleanly with the
+	      three-term loss at the published weights $(1.0, 1.0, 0.1)$.
+\end{itemize}
+
+\subsection{What was hard}
+
+\begin{itemize}
+	\item Loss-term balancing. $\mathcal{L}_{\text{pseudo}}$ dominates
+	      early training when its weight is set to 1. The published weight of
+	      0.1 was necessary to prevent the pseudo-context generator from
+	      overfitting to its own samples.
+	\item Memory scales as $K \cdot B \cdot 784 \cdot h$. Profiling was
+	      needed to find a workable $K{=}5$. The original paper uses larger $K$
+	      values that did not fit on the development GPU at $B{=}64$.
+	\item Variable context size defeats \texttt{cudnn.benchmark} without
+	      bucketing.
+	\item Numerical stability. A $\sigma$ floor in the decoder,
+	      \verb|y_pred_sigma = 0.1 + 0.9 * softplus(...)|, was required to
+	      prevent NaN log-probs early in training.
+\end{itemize}
+
+\subsection{Takeaways}
+
+\begin{enumerate}
+	\item Neural Processes are a natural fit for GPUs. Batched MLPs and
+	      attention map cleanly to cuBLAS, cuDNN, and SDPA\@.
+	\item The martingale posterior gives prior-free uncertainty in theory,
+	      but $K$ forward passes per step in practice. The GPU is essential, not
+	      optional.
+	\item PyTorch abstracts CUDA well, but the speedups come from knowing
+	      what kernels run. AMP, TF32, SDPA backend selection, the caching
+	      allocator, pinned memory, \texttt{cudnn.benchmark}, CUDA Graphs, and
+	      \texttt{torch.compile} each contribute measurable wins, and each one
+	      has a gotcha that the documentation explicitly warns about.
+\end{enumerate}
+
+\begin{thebibliography}{99}
+	\raggedright{}
+
+	\bibitem{lee2023}
+	H. Lee, E. Yun, G. Nam, E. Fong, and J. Lee.
+	\newblock{}Martingale Posterior Neural Processes.
+	\newblock{}\emph{International Conference on Learning Representations}, 2023.
+	\newblock{}\url{https://arxiv.org/abs/2304.09431}.
+
+	\bibitem{fong2023}
+	E. Fong, C. Holmes, and S. G. Walker.
+	\newblock{}Martingale Posterior Distributions.
+	\newblock{}\emph{Journal of the Royal Statistical Society: Series B}, 2023.
+	\newblock{}\url{https://arxiv.org/abs/2103.15671}.
+
+	\bibitem{garnelo2018}
+	M. Garnelo, J. Schwarz, D. Rosenbaum, F. Viola, D. J. Rezende, S. M. A. Eslami,
+	and Y. W. Teh.
+	\newblock{}Neural Processes.
+	\newblock{}\emph{ICML Workshop}, 2018.
+	\newblock{}\url{https://arxiv.org/abs/1807.01622}.
+
+	\bibitem{lee2019set}
+	J. Lee, Y. Lee, J. Kim, A. Kosiorek, S. Choi, and Y. W. Teh.
+	\newblock{}Set Transformer: A Framework for Attention-based Permutation-Invariant Neural Networks.
+	\newblock{}\emph{International Conference on Machine Learning}, 2019.
+	\newblock{}\url{https://arxiv.org/abs/1810.00825}.
+
+	\bibitem{dupont}
+	E. Dupont.
+	\newblock{}Neural Processes (PyTorch).
+	\newblock{}\url{https://github.com/EmilienDupont/neural-processes}.
+
+	\bibitem{cudasem}
+	PyTorch documentation.
+	\newblock{}CUDA semantics notes.
+	\newblock{}\url{https://docs.pytorch.org/docs/stable/notes/cuda.html}.
+
+	\bibitem{ezyang}
+	E. Z. Yang.
+	\newblock{}PyTorch internals.
+	\newblock{}2019.
+	\newblock{}\url{https://blog.ezyang.com/2019/05/pytorch-internals/}.
+
+	\bibitem{sdpa}
+	PyTorch documentation.
+	\newblock{}\texttt{torch.nn.functional.scaled\_dot\_product\_attention}.
+	\newblock{}\url{https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html}.
+
+	\bibitem{amp}
+	PyTorch documentation.
+	\newblock{}Automatic Mixed Precision package (\texttt{torch.amp}) and AMP examples.
+	\newblock{}\url{https://docs.pytorch.org/docs/stable/amp.html};
+	\url{https://docs.pytorch.org/docs/stable/notes/amp_examples.html}.
+
+	\bibitem{profiler}
+	PyTorch documentation.
+	\newblock{}\texttt{torch.profiler}.
+	\newblock{}\url{https://docs.pytorch.org/docs/stable/profiler.html}.
+
+	\bibitem{memviz}
+	PyTorch documentation.
+	\newblock{}Understanding CUDA Memory Usage.
+	\newblock{}\url{https://docs.pytorch.org/docs/stable/torch_cuda_memory.html}.
+
+	\bibitem{ddp}
+	PyTorch documentation.
+	\newblock{}DistributedDataParallel notes.
+	\newblock{}\url{https://docs.pytorch.org/docs/stable/notes/ddp.html}.
+
+	\bibitem{cublas}
+	NVIDIA Corporation.
+	\newblock{}cuBLAS Library User Guide.
+	\newblock{}\url{https://docs.nvidia.com/cuda/cublas/}.
+
+	\bibitem{cudnn}
+	NVIDIA Corporation.
+	\newblock{}cuDNN Developer Guide.
+	\newblock{}\url{https://docs.nvidia.com/deeplearning/cudnn/developer-guide/}.
+
+	\bibitem{tensorcores}
+	S. Markidis, S. W. D. Chien, E. Laure, I. B. Peng, and J. S. Vetter.
+	\newblock{}NVIDIA Tensor Core Programmability, Performance \& Precision.
+	\newblock{}\emph{IEEE International Parallel and Distributed Processing Symposium Workshops}, 2018.
+	\newblock{}\url{https://arxiv.org/abs/1803.04014}.
+
+	\bibitem{cudacppguide}
+	NVIDIA Corporation.
+	\newblock{}CUDA C++ Programming Guide.
+	\newblock{}\url{https://docs.nvidia.com/cuda/cuda-c-programming-guide/}.
+
+	\bibitem{coopgroups}
+	K. Patel and S. Jones.
+	\newblock{}Cooperative Groups: Flexible CUDA Thread Programming.
+	\newblock{}NVIDIA Developer Blog, 2017.
+	\newblock{}\url{https://developer.nvidia.com/blog/cooperative-groups/}.
+
+	\bibitem{flashattn2}
+	T. Dao.
+	\newblock{}FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning.
+	\newblock{}2023.
+	\newblock{}\url{https://arxiv.org/abs/2307.08691}.
+
+	\bibitem{curand}
+	NVIDIA Corporation.
+	\newblock{}cuRAND Library User Guide.
+	\newblock{}\url{https://docs.nvidia.com/cuda/curand/}.
+
+	\bibitem{thrust}
+	NVIDIA Corporation.
+	\newblock{}Thrust: The C++ Parallel Algorithms Library.
+	\newblock{}\url{https://docs.nvidia.com/cuda/thrust/}.
+
+	\bibitem{torchcompile}
+	PyTorch documentation.
+	\newblock{}\texttt{torch.compile}.
+	\newblock{}\url{https://docs.pytorch.org/docs/stable/generated/torch.compile.html}.
+
+	\bibitem{inductor}
+	J. Ansel et al.
+	\newblock{}PyTorch 2: Faster Machine Learning Through Dynamic Python Bytecode Transformation and Graph Compilation.
+	\newblock{}\emph{ASPLOS}, 2024.
+	\newblock{}\url{https://pytorch.org/assets/pytorch2-2.pdf}.
+
+	\bibitem{allocator}
+	PyTorch documentation.
+	\newblock{}CUDA semantics --- Memory management.
+	\newblock{}\url{https://docs.pytorch.org/docs/stable/notes/cuda.html\#memory-management}.
+
+	\bibitem{nsight}
+	NVIDIA Corporation.
+	\newblock{}Nsight Systems and Nsight Compute User Guides.
+	\newblock{}\url{https://docs.nvidia.com/nsight-systems/};
+	\url{https://docs.nvidia.com/nsight-compute/}.
+
+\end{thebibliography}
+
+\end{document}

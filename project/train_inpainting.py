@@ -184,7 +184,7 @@ def create_model(device: torch.device, lr: float, epochs: int):
         x_dim=X_DIM, y_dim=Y_DIM, r_dim=R_DIM, z_dim=Z_DIM, h_dim=H_DIM,
         num_pseudo_points=NUM_PSEUDO_POINTS,
         num_pseudo_samples=NUM_PSEUDO_SAMPLES,
-        use_autoregressive=False,
+        use_autoregressive=True,
         x_range=(-1, 1),
         loss_weights=LOSS_WEIGHTS,
     ).to(device)

@@ -32,3 +32,12 @@
 
 \.DS_Store
 __pycache__/
+
+# LaTeX auxiliary files
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+paper.synctex.gz
