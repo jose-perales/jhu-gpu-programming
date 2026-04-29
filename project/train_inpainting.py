@@ -38,7 +38,7 @@ H_DIM = 256
 
 # MPNP pseudo-context config
 NUM_PSEUDO_POINTS = 30
-NUM_PSEUDO_SAMPLES = 10
+NUM_PSEUDO_SAMPLES = 5
 LOSS_WEIGHTS = {"marg": 1.0, "amort": 1.0, "pseudo": 0.1}
 
 # Training defaults (paper: 50K train, 10K val, 10K test)
