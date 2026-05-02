@@ -14,7 +14,7 @@ Or step by step:
 
 ```bash
 make preprocess   # download MNIST, print dataset stats, save sample grid
-make train        # train MPNP for 100 epochs (use train-quick for 20)
+make train        # train MPNP for 150 epochs (use train-quick for 20)
 make postprocess  # generate inpainting comparison figures
 ```
 
@@ -35,7 +35,7 @@ The model reconstructs digit structure from sparse context and concentrates unce
 ## Usage
 
 ```bash
-uv run train_inpainting.py --epochs 100 --lr 5e-4 --seed 42
+uv run train_inpainting.py --epochs 150 --lr 5e-4 --seed 42
 uv run postprocess.py --num_context 100 --num_samples 30 --num_images 10
 ```
 
@@ -50,6 +50,8 @@ The training loss combines three terms:
 | $\mathcal{L}_\text{marg}$ | Marginal likelihood via log-mean-exp over $K$ pseudo-samples |
 | $\mathcal{L}_\text{amort}$ | Amortisation — context-only likelihood |
 | $\mathcal{L}_\text{pseudo}$ | Encourages pseudo-contexts to be predictive of targets |
+
+The Polya-urn predictive resampling assignment from Module 9 (`module9/assignment/`) is a hand-written CUDA prototype of the same algorithm: cuRAND for the predictive samples, Thrust for the posterior summary. The PyTorch model in this repository runs the same predictive-resampling-for-Bayesian-inference idea on a learned neural-process predictive, with PyTorch's in-tree Philox replacing cuRAND and ATen reductions replacing Thrust.
 
 ## References
 

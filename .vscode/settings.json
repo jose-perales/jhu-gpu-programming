@@ -1,0 +1,38 @@
+{
+  "cSpell.words": [
+      "binom",
+      "htbp",
+      "includegraphics",
+      "mathbf",
+      "pagebreak",
+      "textbf",
+      "textwidth"
+  ],
+  "latex-workshop.diagnostics.ignorePatterns": [
+    "paper.tex"
+  ],
+  "latex-workshop.latex.tools": [
+    {
+      "name": "latexmk",
+      "command": "latexmk",
+      "args": [
+        "-shell-escape",
+        "-synctex=1",
+        "-interaction=nonstopmode",
+        "-file-line-error",
+        "-pdf",
+        "-outdir=%OUTDIR%",
+        "%DOC%"
+      ],
+      "env": {}
+    }
+  ],
+  "emeraldwalk.runonsave": {
+    "commands": [
+      {
+        "match": ".*/project/paper/.*\\.tex$",
+        "cmd": "make -C ${workspaceFolder}/project/paper format-one FILE=${file} && make -C ${workspaceFolder}/project/paper build-tex-keep-pdf DIR=${fileDirname}"
+      }
+    ]
+  }
+}

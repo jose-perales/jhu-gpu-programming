@@ -1,0 +1,7 @@
+services:
+  math_workspace:
+    build:
+      dockerfile: Dockerfile
+    volumes:
+      - ../:/workspace
+    command: sleep infinity
