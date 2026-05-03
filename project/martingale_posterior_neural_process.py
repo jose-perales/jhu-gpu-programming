@@ -267,8 +267,9 @@ class MartingalePosteriorNeuralProcess(nn.Module):
             x_pseudo = pseudo_xy[..., :self.x_dim]
             # y component is encoded in the second half but we'll regenerate y from decoder
             
-            # For x coordinates, apply sigmoid to get [0,1] then scale to [-2pi, 2pi] for sine waves
-            x_pseudo = 4 * pi * (torch.sigmoid(x_pseudo) - 0.5)
+            # Rescale x coordinates into the configured input range via sigmoid -> [x_min, x_max]
+            x_min, x_max = self.x_range
+            x_pseudo = torch.sigmoid(x_pseudo) * (x_max - x_min) + x_min
             
             # For y, decode to get proper predictions with uncertainty
             z_sample = q_context.rsample()  # sample latent

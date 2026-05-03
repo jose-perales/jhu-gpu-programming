@@ -1,0 +1,8 @@
+{
+  "fp32_cpu_ms": 1299.9691057,
+  "fp32_gpu_ms": 39.311134200000005,
+  "tf32_gpu_ms": 32.904262,
+  "bf16_gpu_ms": 27.4237411,
+  "compile_gpu_ms": 34.122145,
+  "device_name": "NVIDIA GeForce RTX 3080"
+}

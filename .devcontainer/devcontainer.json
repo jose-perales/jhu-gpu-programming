@@ -1,0 +1,25 @@
+{
+    "name": "math_workspace_container",
+    "dockerComposeFile": "./docker-compose.yaml",
+    "service": "math_workspace",
+    "workspaceFolder": "/workspace/",
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "terminal.integrated.shell.linux": "/bin/zsh",
+                "terminal.integrated.defaultProfile.linux": "zsh"
+            },
+            "extensions": [
+                "ms-python.python",
+                "charliermarsh.ruff",
+                "emeraldwalk.runonsave",
+                "shd101wyy.markdown-preview-enhanced",
+                "mathematic.vscode-latex",
+                "goessner.mdmath",
+                "yzhang.markdown-all-in-one",
+                "james-yu.latex-workshop"
+            ]
+        }
+    },
+    "remoteUser": "vscode"
+}
